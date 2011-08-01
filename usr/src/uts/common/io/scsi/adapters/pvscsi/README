@@ -1,0 +1,8 @@
+Solaris driver for VMware para-virtualized SCSI HBA.
+
+NOTES:
+
+1. Currently driver builds as a standalone module.
+2. Since vmw_pvscsi.h has not yet been ported from Linux to be a
+   CDDL-compliant, driver builds with errors (i.e. doesn't build),
+   unless the header is not copied from Linux to the driver's directory (pvscsi).
