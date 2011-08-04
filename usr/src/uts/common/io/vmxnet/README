@@ -1,0 +1,5 @@
+vmxnet3 driver for OpenSolaris.
+
+NOTES:
+1. Currently driver is built in form of a standalone driver.
+2. Module's name is: vmxnex3, not vmxnet3s.
