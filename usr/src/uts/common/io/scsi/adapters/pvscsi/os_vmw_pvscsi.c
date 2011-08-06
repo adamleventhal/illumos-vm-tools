@@ -34,6 +34,7 @@
 #include <sys/pci.h>
 #include <sys/atomic.h>
 #include <sys/list.h>
+#include <sys/cpuvar.h>
 
 #pragma pack(1)
 #include "vmw_pvscsi.h"
@@ -56,12 +57,21 @@ enum {
         VMW_PVSCSI_CMD_TAG = 0x0008,
         VMW_PVSCSI_CMD_IO_READ = 0x0010,
         VMW_PVSCSI_CMD_IO_WRITE = 0x0020,
+        VMW_PVSCSI_CMD_IO_IOPB = 0x0040,
+        VMW_PVSCSI_CMD_DONE = 0x0080,
 
         VMW_PVSCSI_CMD_IO = (VMW_PVSCSI_CMD_IO_READ |
                              VMW_PVSCSI_CMD_IO_WRITE),
         VMW_PVSCSI_CMD_EXT = (VMW_PVSCSI_CMD_CDB_EXT |
                               VMW_PVSCSI_CMD_SCB_EXT |
                               VMW_PVSCSI_CMD_PRIV_EXT)
+};
+
+enum {
+        VMW_PVSCSI_CMD_INITED, /* xxx_init_pkt() called, ready for I/O. */
+        VMW_PVSCSI_CMD_IO_SUBMITTED, /* Command has been sent to the target. */
+        VMW_PVSCSI_CMD_IO_DONE, /* Command has been performed by the target. */
+        VMW_PVSCSI_CMD_COMPLETE, /* Completion handler has been called. */
 };
 
 struct vmw_pvscsi_cmd;
@@ -82,17 +92,40 @@ typedef struct vmw_pvscsi_cmd {
         size_t statuslen;
         unsigned char tag;
         int flags;
+        int state;
         vmw_pvscsi_cmd_ctx_t *ctx;
         ddi_dma_handle_t cmd_handle;
+        struct vmw_pvscsi_cmd *next_cmd; /* For chained requests. */
+        struct vmw_pvscsi_cmd *tail_cmd;
         struct scsi_pkt cached_pkt;
 } vmw_pvscsi_cmd_t;
 
 #define PKT2CMD(pkt) ((vmw_pvscsi_cmd_t *)((pkt)->pkt_ha_private))
+#define CMD2PKT(cmd) ((struct scsi_pkt *)((cmd)->pkt))
 
 #define CMD_CTX_SGLIST_VA(cmd_ctx) ((struct PVSCSISGElement *)(((vmw_pvscsi_cmd_ctx_t *)(cmd_ctx))->dma_buf.addr))
 #define CMD_CTX_SGLIST_PA(cmd_ctx) ((caddr_t)(((vmw_pvscsi_cmd_ctx_t *)(cmd_ctx))->dma_buf.pa))
 
 #define CMD_CACHE_ITEM_SIZE (sizeof(vmw_pvscsi_cmd_t))
+
+#define MAX_WORKER_THREADS 8
+#define WORKER_THREAD_THRESHOLD 3
+
+typedef struct vmw_pvscsi_worker_state {
+        kmutex_t mtx;
+        vmw_pvscsi_cmd_t *head_cmd;
+        vmw_pvscsi_cmd_t *tail_cmd;
+        kcondvar_t cv;
+        kthread_t *thread;
+        struct vmw_pvscsi_softstate *pvs;
+        int id;
+        int flags;
+} vmw_pvscsi_worker_state_t;
+
+enum {
+        VMW_IRQ_WORKER_ACTIVE = 0x01,
+        VMW_IRQ_WORKER_SHUTDOWN = 0x02,
+};
 
 typedef struct vmw_pvscsi_softstate {
         dev_info_t  *m_dip;
@@ -123,6 +156,9 @@ typedef struct vmw_pvscsi_softstate {
         kmutex_t mtx;
         struct kmem_cache *cmd_cache;
         int num_luns;
+        int num_workers;
+        int worker_threshold;
+        vmw_pvscsi_worker_state_t *workers_state;
 } vmw_pvscsi_softstate_t;
 
 #define REQ_RING(pvs) ((struct PVSCSIRingReqDesc *)(((vmw_pvscsi_softstate_t *)(pvs))->req_ring_buf.addr))
@@ -403,6 +439,8 @@ static void vmw_pvscsi_submit_rw_io(vmw_pvscsi_softstate_t *pvs)
 static void vmw_pvscsi_submit_command(vmw_pvscsi_softstate_t *pvs,
                                       vmw_pvscsi_cmd_t *cmd)
 {
+        cmd->state = VMW_PVSCSI_CMD_IO_SUBMITTED;
+
 	if (scsi_is_rw(pkt)) {
 		vmw_pvscsi_submit_rw_io(pvs);
         } else {
@@ -445,6 +483,24 @@ static u64 vmw_pvscsi_map_context(vmw_pvscsi_softstate_t *pvs,
                                   vmw_pvscsi_cmd_ctx_t *io_ctx)
 {
 	return io_ctx - pvs->cmd_ctx + 1;
+}
+
+static vmw_pvscsi_cmd_ctx_t *vmw_pvscsi_resolve_context(vmw_pvscsi_softstate_t *pvs,
+                                                        uint64_t ctx)
+{
+        if (ctx > 0 && ctx <= pvs->req_depth) {
+                return &pvs->cmd_ctx[ctx - 1];
+        } else {
+                return NULL;
+        }
+}
+
+static int vmw_pvscsi_poll_cmd(vmw_pvscsi_softstate_t *pvs, vmw_pvscsi_cmd_t *cmd)
+{
+        while (!(cmd->flags | VMW_PVSCSI_CMD_DONE)) {
+                delay(50);
+        }
+        return (TRAN_ACCEPT);
 }
 
 static int vmw_pvscsi_queue_cmd(vmw_pvscsi_softstate_t *pvs, vmw_pvscsi_cmd_t *cmd,
@@ -536,8 +592,14 @@ vmw_pvscsi_start(struct scsi_address *ap, struct scsi_pkt *pkt)
                 goto out_unlock;
         }
 
+        rc = TRAN_ACCEPT;   
         vmw_pvscsi_submit_command(pvs, cmd);
-        rc = TRAN_ACCEPT;
+
+        if (pkt->pkt_flags & FLAG_NOINTR) {
+                mutex_exit(&pvs->mtx);
+                rc = vmw_pvscsi_poll_cmd(pvs, cmd);
+                return (rc);
+        }
 
 out_unlock:
         mutex_exit(&pvs->mtx);
@@ -570,7 +632,7 @@ vmw_pvscsi_setcap(struct scsi_address *ap, char *cap, int value, int tgtonly)
 
 static void vmw_pvscsi_cmd_ext_free(vmw_pvscsi_cmd_t *cmd)
 {
-        struct scsi_pkt *pkt = cmd->pkt;
+        struct scsi_pkt *pkt = CMD2PKT(cmd);
 
         if (cmd->flags & VMW_PVSCSI_CMD_CDB_EXT) {
                 kmem_free(pkt->pkt_cdbp, cmd->cmdlen);
@@ -590,7 +652,7 @@ static int
 vmw_pvscsi_cmd_ext_alloc(vmw_pvscsi_softstate_t *pvs, vmw_pvscsi_cmd_t *cmd, int kf)
 {
         void *buf;
-        struct scsi_pkt *pkt = cmd->pkt;
+        struct scsi_pkt *pkt = CMD2PKT(cmd);
 
         if (cmd->cmdlen > sizeof (cmd->cmd_cdb)) {
                 if((buf = kmem_zalloc(cmd->cmdlen, kf)) == NULL) {
@@ -685,11 +747,32 @@ vmw_pvscsi_init_pkt(struct scsi_address *ap, struct scsi_pkt *pkt,
 
         /* Setup data buffer. */
         if ((bp != NULL) && (bp->b_bcount > 0)) {
+                int dma_flags;
+
                 /* TODO: add support of buffers.See scsa1394_cmd_buf_dma_alloc() for details. */
+                if (bp->b_flags & B_READ) {
+                        cmd->flags |= VMW_PVSCSI_CMD_IO_READ;
+                        dma_flags = DDI_DMA_READ;
+                } else {
+                        cmd->flags |= VMW_PVSCSI_CMD_IO_WRITE;
+                        dma_flags = DDI_DMA_WRITE;
+                }
+
+                if (flags & PKT_CONSISTENT) {
+			cmd->flags |= VMW_PVSCSI_CMD_IO_IOPB;
+			dma_flags |= DDI_DMA_CONSISTENT;
+		}
+
+                if (flags & PKT_DMA_PARTIAL) {
+			dma_flags |= DDI_DMA_PARTIAL;
+		}
+
+                /* TODO: Setup buffer's DMA resources properly. See mptsas_scsi_init_pkt(). */
                 _LOG("I/O buffers are not supported yet !");
                 goto out;
         }
 
+        cmd->state = VMW_PVSCSI_CMD_INITED;
         return (pkt);
 out:
         if (is_new) {
@@ -1222,10 +1305,93 @@ static int vmw_pvscsi_msg_pending(vmw_pvscsi_softstate_t *pvs)
 	return sdesc->msgProdIdx != sdesc->msgConsIdx;
 }
 
-
 static void vmw_pvscsi_process_irq(vmw_pvscsi_softstate_t *pvs)
 {
-        /* TODO: Actual IRQ handling is done here. */
+        vmw_pvscsi_cmd_t **pnext_cmd;
+        vmw_pvscsi_cmd_t *cmds_for_workers[MAX_WORKER_THREADS];
+        struct PVSCSIRingsState *sdesc = RINGS_STATE(pvs);
+	uint32_t e = sdesc->cmpNumEntriesLog2;
+        int slot = 0, item = 0;
+        boolean_t is_new_slot = B_TRUE;
+        vmw_pvscsi_cmd_t *cmd;
+
+        bzero(cmds_for_workers, sizeof(cmds_for_workers));
+
+        mutex_enter(&pvs->mtx);
+        while (sdesc->cmpConsIdx != sdesc->cmpProdIdx) {
+                vmw_pvscsi_cmd_ctx_t *ctx;
+                struct PVSCSIRingCmpDesc *cdesc;
+
+                cdesc = CMP_RING(pvs) + (sdesc->cmpConsIdx & MASK(e));
+                membar_consumer();
+
+                ctx = vmw_pvscsi_resolve_context(pvs, cdesc->context);
+                ASSERT(ctx);
+
+                cmd = ctx->cmd;
+                ASSERT(cmd);
+                cmd->next_cmd = NULL;
+
+                if (is_new_slot) {
+                        if (cmds_for_workers[slot] != NULL) {
+                                cmds_for_workers[slot]->tail_cmd->next_cmd = cmd;
+                        } else {
+                                cmds_for_workers[slot] = cmd;
+                        }
+                        pnext_cmd = &cmd->next_cmd;
+                        is_new_slot = B_FALSE;
+                } else {
+                        *pnext_cmd = cmd;
+                        pnext_cmd = &cmd->next_cmd;
+                }
+
+                item++;
+                cmds_for_workers[slot]->tail_cmd = cmd;
+
+                if (item == pvs->worker_threshold) {
+                        item = 0;
+                        slot++;
+                        is_new_slot = B_TRUE;
+
+                        if (slot == pvs->num_workers) {
+                                slot = 0;
+                        }
+                }
+
+                membar_producer();
+                sdesc->cmpConsIdx++;
+        }
+        mutex_exit(&pvs->mtx);
+
+        /* Now go through the completed requests and schedule actions
+         * to handle them in kernel thread context.
+         */
+        for (slot = 0; slot < pvs->num_workers; slot++) {
+                vmw_pvscsi_worker_state_t *ws;
+
+                cmd = cmds_for_workers[slot];
+
+                if (!cmd) {
+                        break;
+                }
+                _LOG("SLOT: %d", slot);
+
+                ws = &pvs->workers_state[slot];
+
+                mutex_enter(&ws->mtx);
+                if (ws->head_cmd == NULL) {
+                        ws->head_cmd = cmd;
+                        ws->tail_cmd = cmd->tail_cmd;
+                } else {
+                        ws->tail_cmd->next_cmd = cmd;
+                        ws->tail_cmd = cmd->tail_cmd;
+                }
+
+                if (!(ws->flags & VMW_IRQ_WORKER_ACTIVE)) {
+                        cv_signal(&ws->cv);
+                }
+                mutex_exit(&ws->mtx);
+        }
 }
 
 static uint32_t vmw_pvscsi_irq_handler(caddr_t arg1, caddr_t arg2)
@@ -1246,16 +1412,11 @@ static uint32_t vmw_pvscsi_irq_handler(caddr_t arg1, caddr_t arg2)
                 }
         }
 
+        _LOG("handled: %d", handled);
         if (handled) {
-                mutex_enter(&pvs->mtx);
                 vmw_pvscsi_process_irq(pvs);
-                if (pvs->use_msg && vmw_pvscsi_msg_pending(pvs)) {
-                        _LOG("> Queuing work !");
-                        /* TODO: Implement work schedule in IRQ handler. */
-                }
-                mutex_exit(&pvs->mtx);
         }
-        return (DDI_INTR_CLAIMED);
+        return (handled) ? (DDI_INTR_CLAIMED) : (DDI_INTR_UNCLAIMED) ;
 }
 
 static int vmw_pvscsi_install_irq_handler(vmw_pvscsi_softstate_t *pvs,
@@ -1358,6 +1519,84 @@ static int vmw_pvscsi_setup_irq(vmw_pvscsi_softstate_t *pvs)
         return (pvs->irq_type == 0) ? (DDI_FAILURE) : (DDI_SUCCESS);
 }
 
+
+static void vmw_pvscsi_complete_command(vmw_pvscsi_cmd_t *cmd)
+{
+        struct scsi_pkt *pkt = CMD2PKT(cmd);
+
+        if (pkt) {
+                ASSERT((cmd->flags & VMW_PVSCSI_CMD_DONE) == 0);
+
+                if ((pkt->pkt_flags & FLAG_NOINTR) == 0) {
+                        if ((cmd->flags & VMW_PVSCSI_CMD_IO_IOPB) &&
+                            (cmd->flags & VMW_PVSCSI_CMD_IO_READ)) {
+                                ddi_dma_sync(cmd->cmd_handle, 0, 0, DDI_DMA_SYNC_FORCPU);
+                        }
+                } else { /* FLAG_NOINTR */
+                        if (pkt->pkt_comp) {
+                                (*pkt->pkt_comp)(pkt);
+                        }
+                }
+                cmd->flags |= VMW_PVSCSI_CMD_DONE;
+                membar_producer();
+        }
+}
+
+static void vmw_pvscsi_irq_worker_fn(vmw_pvscsi_worker_state_t *ws)
+{
+        boolean_t active = B_TRUE;
+        vmw_pvscsi_cmd_t *cmd;
+
+        while (active) {
+                mutex_enter(&ws->mtx);
+                if (ws->flags & VMW_IRQ_WORKER_SHUTDOWN) {
+                        active = B_FALSE;
+                }
+                if (ws->head_cmd) {
+                        cmd = ws->head_cmd;
+                        cmd->tail_cmd = NULL;
+                        ws->head_cmd = ws->tail_cmd = NULL;
+                } else {
+                        cmd = NULL;
+                }
+                mutex_exit(&ws->mtx);
+
+                if (cmd) {
+                        vmw_pvscsi_cmd_t *scmd = cmd->next_cmd;
+
+                        
+                        cmd = scmd;
+                }
+        }
+}
+
+static int vmw_pvscsi_setup_irq_workers(vmw_pvscsi_softstate_t *pvs)
+{
+        int i;
+
+        pvs->workers_state = kmem_alloc(pvs->num_workers * sizeof(vmw_pvscsi_worker_state_t),
+                                        KM_SLEEP);
+        if (pvs->workers_state == NULL) {
+                return (DDI_FAILURE);
+        }
+
+        for (i = 0; i < pvs->num_workers; i++) {
+                vmw_pvscsi_worker_state_t *ws = &pvs->workers_state[i];
+
+                cv_init(&ws->cv, "VMW PVSCSI worker CV", CV_DRIVER, NULL);
+                mutex_init(&ws->mtx, "VMW PVSCSI worker MTX", MUTEX_DRIVER,
+                           NULL);
+                ws->flags = 0;
+                ws->head_cmd = ws->tail_cmd = NULL;
+                ws->pvs = pvs;
+                ws->id = i;
+                ws->thread = thread_create(NULL, 0, vmw_pvscsi_irq_worker_fn,
+                                           ws, 0, &p0, TS_RUN, minclsyspri);
+        }
+
+        return (DDI_SUCCESS);
+}
+
 static int cmd_cache_constructor(void *buf, void *cdrarg, int kmflags)
 {
         vmw_pvscsi_softstate_t *pvs = cdrarg;
@@ -1428,6 +1667,8 @@ static int vmw_pvscsi_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
         pvs->io_dma_attr = vmw_pvscsi_io_dma_attr;
         pvs->msi_enable = 1; /* TODO: Setup as a property ? */
         pvs->num_luns = 1; /* TODO: Setup number of LUNs properly. */
+        pvs->num_workers = MAX_WORKER_THREADS;
+        pvs->worker_threshold = WORKER_THREAD_THRESHOLD;
         mutex_init(&pvs->mtx, "PVSCSI instance mutex", MUTEX_DRIVER, NULL);
         list_create(&pvs->cmd_ctx_pool, sizeof(vmw_pvscsi_cmd_ctx_t),
                     offsetof(vmw_pvscsi_cmd_ctx_t, list));
@@ -1470,8 +1711,12 @@ static int vmw_pvscsi_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
         }
         _LOG("-2");
 
-        if (vmw_pvscsi_hba_setup(pvs) != 0) {
+        if (vmw_pvscsi_setup_irq_workers(pvs) != DDI_SUCCESS) {
                 goto clear_sg;
+        }
+
+        if (vmw_pvscsi_hba_setup(pvs) != 0) {
+                goto clear_irq_workers;
         }
 
         _LOG("INT status (for testing device accessibility): 0x%X\n", vmw_pvscsi_read_intr_status(pvs));
@@ -1487,7 +1732,9 @@ static int vmw_pvscsi_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
         _DBG("vmw_pvscsi_attach(): New instance of PVSCSI HBA attached.");
         return (DDI_SUCCESS);
 clear_hba:
-        /* Rollback HBA initialization here. */
+        /* TODO: Rollback HBA initialization here. */
+clear_irq_workers:
+        /* TODO: Shutdown IRQ worker threads properly. */
 clear_sg:
         vmw_pvscsi_free_sg(pvs);
 clear_irq:
