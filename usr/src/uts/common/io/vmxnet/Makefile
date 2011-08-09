@@ -31,7 +31,7 @@ $(if $(SUPPORTED),,$(error "Unsupported Solaris version: $(VM_UNAME)"))
 
 LD=/usr/ccs/bin/ld
 
-MODULE    := vmxnet3
+MODULE    := vmxnet3s
 CFLAGS    :=
 LDFLAGS   := 
 

@@ -176,7 +176,7 @@ void      vmxnet3_rxqueue_fini(vmxnet3_softc_t *dp, vmxnet3_rxqueue_t *rxq);
 
 extern ddi_device_acc_attr_t vmxnet3_dev_attr;
 
-#define VMXNET3_MODNAME "vmxnet3"
+#define VMXNET3_MODNAME "vmxnet3s"
 
 /* Logging stuff */
 #define VMXNET3_LOG(Level, Device, Format, Args...)   \

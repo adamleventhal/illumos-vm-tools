@@ -103,13 +103,19 @@ vmxnet3_tx_prepare_offload(vmxnet3_softc_t *dp,
                            mblk_t *mp)
 {
    int ret = 0;
-   uint32_t start, stuff, value, flags;
+   uint32_t start, stuff, value, flags, lsoflags, mss;
 
    ol->om = VMXNET3_OM_NONE;
    ol->hlen = 0;
    ol->msscof = 0;
 
    hcksum_retrieve(mp, NULL, NULL, &start, &stuff, NULL, &value, &flags);
+
+   mac_lso_get(mp, &mss, &lsoflags);
+   if (lsoflags & HW_LSO) {
+           flags |= HW_LSO;
+   }
+
    if (flags) {
       struct ether_vlan_header *eth = (void *) mp->b_rptr;
       uint8_t ethLen;
@@ -132,8 +138,6 @@ vmxnet3_tx_prepare_offload(vmxnet3_softc_t *dp,
          mblk_t *mblk = mp;
          uint8_t *ip, *tcp;
          uint8_t ipLen, tcpLen;
-
-	cmn_err(CE_WARN, "-> LSO\n");
 
          /*
           * Copy e1000g's behavior:
