@@ -1545,27 +1545,36 @@ static void vmw_pvscsi_complete_command(vmw_pvscsi_cmd_t *cmd)
 static void vmw_pvscsi_irq_worker_fn(vmw_pvscsi_worker_state_t *ws)
 {
         boolean_t active = B_TRUE;
-        vmw_pvscsi_cmd_t *cmd;
+        vmw_pvscsi_cmd_t *cmd, *scmd;
 
         while (active) {
                 mutex_enter(&ws->mtx);
+
+                if (!ws->head_cmd) {
+                        if (!(ws->flags & VMW_IRQ_WORKER_SHUTDOWN)) {
+                                _LOG("Worker %d is going to sleep.", ws->id);
+                                ws->flags &= ~VMW_IRQ_WORKER_ACTIVE;
+                                cv_wait(&ws->cv, &ws->mtx);
+                                _LOG("Worker %d got woken up.", ws->id);
+                        }
+                }
+
                 if (ws->flags & VMW_IRQ_WORKER_SHUTDOWN) {
                         active = B_FALSE;
                 }
-                if (ws->head_cmd) {
-                        cmd = ws->head_cmd;
+
+                cmd = ws->head_cmd;
+                if (cmd) {
                         cmd->tail_cmd = NULL;
                         ws->head_cmd = ws->tail_cmd = NULL;
-                } else {
-                        cmd = NULL;
-                }
-                mutex_exit(&ws->mtx);
+                        ws->flags |= VMW_IRQ_WORKER_ACTIVE;
+                        mutex_exit(&ws->mtx);
 
-                if (cmd) {
-                        vmw_pvscsi_cmd_t *scmd = cmd->next_cmd;
-
-                        
-                        cmd = scmd;
+                        while (cmd) {
+                                scmd = cmd->next_cmd;
+                                vmw_pvscsi_complete_command(cmd);
+                                cmd = scmd;
+                        }
                 }
         }
 }
