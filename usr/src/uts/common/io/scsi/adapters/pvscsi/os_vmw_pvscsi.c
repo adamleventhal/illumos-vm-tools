@@ -497,6 +497,7 @@ static vmw_pvscsi_cmd_ctx_t *vmw_pvscsi_resolve_context(vmw_pvscsi_softstate_t *
 
 static int vmw_pvscsi_poll_cmd(vmw_pvscsi_softstate_t *pvs, vmw_pvscsi_cmd_t *cmd)
 {
+        _LOG("* Polling command %p", cmd);
         while (!(cmd->flags | VMW_PVSCSI_CMD_DONE)) {
                 delay(50);
         }
@@ -595,12 +596,14 @@ vmw_pvscsi_start(struct scsi_address *ap, struct scsi_pkt *pkt)
         rc = TRAN_ACCEPT;   
         vmw_pvscsi_submit_command(pvs, cmd);
 
+        _LOG("---> cmd: %p, pkt flags: 0x%X", cmd, pkt->pkt_flags);
         if (pkt->pkt_flags & FLAG_NOINTR) {
                 mutex_exit(&pvs->mtx);
                 rc = vmw_pvscsi_poll_cmd(pvs, cmd);
                 return (rc);
         }
 
+        _LOG("---> start: %d", rc);
 out_unlock:
         mutex_exit(&pvs->mtx);
         return (rc);
@@ -1035,7 +1038,7 @@ static void __test_fn(void *arg)
         //struct buf *bp;
 
         _DBG_FUN();
-        delay(400);
+        delay(1000);
         _LOG("Got woken up ! Allocating a SCSI packet.");
 
         /* Setup SCSI address for the target. */
@@ -1524,21 +1527,24 @@ static void vmw_pvscsi_complete_command(vmw_pvscsi_cmd_t *cmd)
 {
         struct scsi_pkt *pkt = CMD2PKT(cmd);
 
+        _LOG("* Completing command %p (%p)", cmd, pkt);
         if (pkt) {
                 ASSERT((cmd->flags & VMW_PVSCSI_CMD_DONE) == 0);
 
-                if ((pkt->pkt_flags & FLAG_NOINTR) == 0) {
-                        if ((cmd->flags & VMW_PVSCSI_CMD_IO_IOPB) &&
-                            (cmd->flags & VMW_PVSCSI_CMD_IO_READ)) {
-                                ddi_dma_sync(cmd->cmd_handle, 0, 0, DDI_DMA_SYNC_FORCPU);
-                        }
-                } else { /* FLAG_NOINTR */
-                        if (pkt->pkt_comp) {
-                                (*pkt->pkt_comp)(pkt);
-                        }
+                if ((cmd->flags & VMW_PVSCSI_CMD_IO_IOPB) &&
+                    (cmd->flags & VMW_PVSCSI_CMD_IO_READ)) {
+                        _LOG("* Syncing DMA upon command completion.");
+                        ddi_dma_sync(cmd->cmd_handle, 0, 0, DDI_DMA_SYNC_FORCPU);
                 }
+
                 cmd->flags |= VMW_PVSCSI_CMD_DONE;
                 membar_producer();
+
+                if (pkt->pkt_comp) {
+                        (*pkt->pkt_comp)(pkt);
+                }
+
+                _LOG("* Command %p completed.", cmd);
         }
 }
 
@@ -1549,14 +1555,11 @@ static void vmw_pvscsi_irq_worker_fn(vmw_pvscsi_worker_state_t *ws)
 
         while (active) {
                 mutex_enter(&ws->mtx);
-
-                if (!ws->head_cmd) {
-                        if (!(ws->flags & VMW_IRQ_WORKER_SHUTDOWN)) {
-                                _LOG("Worker %d is going to sleep.", ws->id);
-                                ws->flags &= ~VMW_IRQ_WORKER_ACTIVE;
-                                cv_wait(&ws->cv, &ws->mtx);
-                                _LOG("Worker %d got woken up.", ws->id);
-                        }
+                if (!ws->head_cmd && !(ws->flags & VMW_IRQ_WORKER_SHUTDOWN)) {
+                        _LOG("Worker %d is going to sleep.", ws->id);
+                        ws->flags &= ~VMW_IRQ_WORKER_ACTIVE;
+                        cv_wait(&ws->cv, &ws->mtx);
+                        _LOG("Worker %d got woken up.", ws->id);
                 }
 
                 if (ws->flags & VMW_IRQ_WORKER_SHUTDOWN) {
