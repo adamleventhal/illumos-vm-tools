@@ -56,22 +56,14 @@ enum {
         VMW_PVSCSI_CMD_PRIV_EXT = 0x0004,
         VMW_PVSCSI_CMD_TAG = 0x0008,
         VMW_PVSCSI_CMD_IO_READ = 0x0010,
-        VMW_PVSCSI_CMD_IO_WRITE = 0x0020,
         VMW_PVSCSI_CMD_IO_IOPB = 0x0040,
         VMW_PVSCSI_CMD_DONE = 0x0080,
+        VMW_PVSCSI_CMD_DMA_VALID = 0x0100,
+        VMW_PVSCSI_CMD_XARQ = 0x0200,
 
-        VMW_PVSCSI_CMD_IO = (VMW_PVSCSI_CMD_IO_READ |
-                             VMW_PVSCSI_CMD_IO_WRITE),
         VMW_PVSCSI_CMD_EXT = (VMW_PVSCSI_CMD_CDB_EXT |
                               VMW_PVSCSI_CMD_SCB_EXT |
                               VMW_PVSCSI_CMD_PRIV_EXT)
-};
-
-enum {
-        VMW_PVSCSI_CMD_INITED, /* xxx_init_pkt() called, ready for I/O. */
-        VMW_PVSCSI_CMD_IO_SUBMITTED, /* Command has been sent to the target. */
-        VMW_PVSCSI_CMD_IO_DONE, /* Command has been performed by the target. */
-        VMW_PVSCSI_CMD_COMPLETE, /* Completion handler has been called. */
 };
 
 struct vmw_pvscsi_cmd;
@@ -81,6 +73,16 @@ typedef struct vmw_pvscsi_cmd_ctx {
         struct vmw_pvscsi_cmd *cmd;
         list_node_t list;
 } vmw_pvscsi_cmd_ctx_t;
+
+typedef struct vmw_pvscsi_cmp_desc_stat {
+        uint32_t scsiStatus;
+        uint32_t hostStatus;
+        uint64_t dataLen;
+} vmw_pvscsi_cmp_desc_stat_t;
+
+#define VMW_PVSCSI_MAX_IO_PAGES 16
+#define VMW_PVSCSI_MAX_IO_SIZE (VMW_PVSCSI_MAX_IO_PAGES * PAGE_SIZE) /* 64 KB */
+#define VMW_PVSCSI_MAX_SG_SIZE (VMW_PVSCSI_MAX_IO_PAGES + 1)
 
 typedef struct vmw_pvscsi_cmd {
         struct scsi_pkt *pkt;
@@ -92,11 +94,21 @@ typedef struct vmw_pvscsi_cmd {
         size_t statuslen;
         unsigned char tag;
         int flags;
-        int state;
+        ulong_t dma_count;
+        vmw_pvscsi_cmp_desc_stat_t cmp_stat;
         vmw_pvscsi_cmd_ctx_t *ctx;
         ddi_dma_handle_t cmd_handle;
+        ddi_dma_cookie_t cmd_cookie;
+	uint_t cmd_cookiec;
+        uint_t cmd_winindex;
+	uint_t cmd_nwin;
+        off_t cmd_dma_offset;
+	size_t cmd_dma_len;
+        uint_t cmd_dma_count;
+        uint_t cmd_total_dma_count;
         struct vmw_pvscsi_cmd *next_cmd; /* For chained requests. */
         struct vmw_pvscsi_cmd *tail_cmd;
+        ddi_dma_cookie_t cached_cookies[VMW_PVSCSI_MAX_SG_SIZE];
         struct scsi_pkt cached_pkt;
 } vmw_pvscsi_cmd_t;
 
@@ -184,6 +196,8 @@ static int vmw_pvscsi_ioctl(dev_t dev, int cmd, intptr_t data, int mode, cred_t 
                             int *rval);
 static int vmw_pvscsi_power(dev_info_t *dip, int component, int level);
 static int vmw_pvscsi_quiesce(dev_info_t *devi);
+
+extern int pvscsi_test(scsi_hba_tran_t	*m_tran);
 
 static struct cb_ops vmw_pvscsi_cb_ops = {
 	scsi_hba_open,		/* open */
@@ -273,8 +287,6 @@ static ddi_dma_attr_t vmw_pvscsi_ring_dma_attr = {
         0,	/* dma_attr_flags */
 };
 
-#define VMW_PVSCSI_MAX_IO_SIZE (64 * 1024) /* 64 KB */
-
 /* DMA attributes for buffer I/O */
 static ddi_dma_attr_t vmw_pvscsi_io_dma_attr = {
 	DMA_ATTR_V0,		/* version of this structure */
@@ -286,7 +298,7 @@ static ddi_dma_attr_t vmw_pvscsi_io_dma_attr = {
 	1,			/* minimum transfer */
 	0xffffffffU,		/* maximum transfer */
 	0xffffffffULL,	/* maximum segment length */
-	17,			/* maximum number of segments */
+	VMW_PVSCSI_MAX_SG_SIZE, /* maximum number of segments */
 	512,			/* granularity */
         0,	/* dma_attr_flags */
 };
@@ -434,14 +446,10 @@ static void vmw_pvscsi_submit_rw_io(vmw_pvscsi_softstate_t *pvs)
 	vmw_pvscsi_reg_write(pvs, PVSCSI_REG_OFFSET_KICK_RW_IO, 0);
 }
 
-#define scsi_is_rw(pkt) 0
-
 static void vmw_pvscsi_submit_command(vmw_pvscsi_softstate_t *pvs,
                                       vmw_pvscsi_cmd_t *cmd)
 {
-        cmd->state = VMW_PVSCSI_CMD_IO_SUBMITTED;
-
-	if (scsi_is_rw(pkt)) {
+	if (cmd->flags & VMW_PVSCSI_CMD_DMA_VALID) {
 		vmw_pvscsi_submit_rw_io(pvs);
         } else {
                 vmw_pvscsi_submit_nonrw_io(pvs);
@@ -497,6 +505,7 @@ static vmw_pvscsi_cmd_ctx_t *vmw_pvscsi_resolve_context(vmw_pvscsi_softstate_t *
 
 static int vmw_pvscsi_poll_cmd(vmw_pvscsi_softstate_t *pvs, vmw_pvscsi_cmd_t *cmd)
 {
+        /* TODO: Implement CMD_TIMEOUT command status for timeouts. */
         _LOG("* Polling command %p", cmd);
         while (!(cmd->flags | VMW_PVSCSI_CMD_DONE)) {
                 delay(50);
@@ -547,7 +556,7 @@ static int vmw_pvscsi_queue_cmd(vmw_pvscsi_softstate_t *pvs, vmw_pvscsi_cmd_t *c
         }
 
         /* Setup I/O direction and map data buffers. */
-        if (cmd->flags & VMW_PVSCSI_CMD_IO) {
+        if (cmd->flags & VMW_PVSCSI_CMD_DMA_VALID) {
                 if (cmd->flags & VMW_PVSCSI_CMD_IO_READ) {
                         rdesc->flags = PVSCSI_FLAG_CMD_DIR_TOHOST;
                 } else {
@@ -699,6 +708,7 @@ vmw_pvscsi_init_pkt(struct scsi_address *ap, struct scsi_pkt *pkt,
         vmw_pvscsi_softstate_t *pvs;
         vmw_pvscsi_cmd_t *cmd;
         boolean_t is_new;
+        int rc, i;
 
         _LOG("pkt: %p, buf: %p", pkt, bp);
 
@@ -710,7 +720,7 @@ vmw_pvscsi_init_pkt(struct scsi_address *ap, struct scsi_pkt *pkt,
                 return (NULL);
         }
 
-        /* Transform target's address. */
+        /* TODO: Transform target's address properly. */
         ap->a_target = 0;
         ap->a_lun = 0;
 
@@ -721,6 +731,7 @@ vmw_pvscsi_init_pkt(struct scsi_address *ap, struct scsi_pkt *pkt,
                 }
 
                 pkt = &cmd->cached_pkt;
+                pkt->pkt_reason = CMD_CMPLT;
                 pkt->pkt_ha_private = (opaque_t)cmd;
                 pkt->pkt_address = *ap;
                 pkt->pkt_scbp = (uchar_t *)&cmd->cmd_scb;
@@ -748,8 +759,15 @@ vmw_pvscsi_init_pkt(struct scsi_address *ap, struct scsi_pkt *pkt,
                 is_new = B_FALSE;
         }
 
+        /* TODO: Handle partial DMA property (i.e. if (cmd->cmd_nwin > 0) ... */
+
+        if (flags & PKT_XARQ) {
+                cmd->flags |= VMW_PVSCSI_CMD_XARQ;
+        }
+
         /* Setup data buffer. */
-        if ((bp != NULL) && (bp->b_bcount > 0)) {
+        if ((bp != NULL) && (bp->b_bcount > 0) &&
+            ((cmd->flags & VMW_PVSCSI_CMD_DMA_VALID) == 0)) {
                 int dma_flags;
 
                 /* TODO: add support of buffers.See scsa1394_cmd_buf_dma_alloc() for details. */
@@ -757,7 +775,7 @@ vmw_pvscsi_init_pkt(struct scsi_address *ap, struct scsi_pkt *pkt,
                         cmd->flags |= VMW_PVSCSI_CMD_IO_READ;
                         dma_flags = DDI_DMA_READ;
                 } else {
-                        cmd->flags |= VMW_PVSCSI_CMD_IO_WRITE;
+                        cmd->flags &= ~VMW_PVSCSI_CMD_IO_READ;
                         dma_flags = DDI_DMA_WRITE;
                 }
 
@@ -771,14 +789,60 @@ vmw_pvscsi_init_pkt(struct scsi_address *ap, struct scsi_pkt *pkt,
 		}
 
                 /* TODO: Setup buffer's DMA resources properly. See mptsas_scsi_init_pkt(). */
-                _LOG("I/O buffers are not supported yet !");
-                goto out;
+                ASSERT(cmd->cmd_handle != NULL);
+
+                rc = ddi_dma_buf_bind_handle(cmd->cmd_handle, bp,
+                                             dma_flags, callback, arg,
+                                             &cmd->cmd_cookie, &cmd->cmd_cookiec);            
+                if (rc == DDI_DMA_PARTIAL_MAP) {
+			cmd->cmd_winindex = 0;
+			ddi_dma_numwin(cmd->cmd_handle, &cmd->cmd_nwin);
+			ddi_dma_getwin(cmd->cmd_handle, cmd->cmd_winindex,
+                                       &cmd->cmd_dma_offset, &cmd->cmd_dma_len,
+                                       &cmd->cmd_cookie, &cmd->cmd_cookiec);
+		} else if (rval && (rval != DDI_DMA_MAPPED)) {
+			switch (rc) {
+			case DDI_DMA_NORESOURCES:
+				bioerror(bp, 0);
+				break;
+			case DDI_DMA_BADATTR:
+			case DDI_DMA_NOMAPPING:
+				bioerror(bp, EFAULT);
+				break;
+			case DDI_DMA_TOOBIG:
+			default:
+				bioerror(bp, EINVAL);
+				break;
+			}
+			cmd->flags &= ~VMW_PVSCSI_CMD_DMA_VALID;
+                        goto out;
+		}
+
+                cmd->flags |= VMW_PVSCSI_CMD_DMA_VALID;
+
+                if (cmd->cmd_cookiec > VMW_PVSCSI_MAX_SG_SIZE) {
+                        _LOG("Large cookie count: %d (max %d)", cmd->cmd_cookiec,
+                             VMW_PVSCSI_MAX_SG_SIZE);
+                        bioerror(bp, EINVAL);
+                        goto out;
+                }
+
+                cmd->cmd_dma_count = cmd->cmd_cookie.dmac_size;
+		cmd->cmd_total_dma_count += cmd->cmd_cookie.dmac_size;
+
+                /* Now calculate total anount of bytes for this I/O and store cookies
+                 * for further processing */
+                for (i=1; i<cmd->cmd_cookiec; i++) {
+                        
+                }
+
+                pkt->pkt_resid = (bp->b_bcount - cmd->cmd_totaldmacount);
         }
 
-        cmd->state = VMW_PVSCSI_CMD_INITED;
         return (pkt);
 out:
         if (is_new) {
+                /* TODO: Implement proper buffer cleanup (including DMA deallocation). */
                 vmw_pvscsi_cmd_ext_free(cmd);
                 kmem_cache_free(pvs->cmd_cache, cmd);
         }
@@ -1024,64 +1088,6 @@ static void vmw_pvscsi_free_sg(vmw_pvscsi_softstate_t *pvs)
         //kmem_free(pvs->cmd_ctx, pvs->req_pages << PAGE_SHIFT);
 }
 
-static int __test_scsi_cb(caddr_t arg)
-{
-        return 0;
-}
-
-static void __test_fn(void *arg)
-{
-        vmw_pvscsi_softstate_t *pvs = (vmw_pvscsi_softstate_t *)arg;
-        struct scsi_pkt *pkt;
-        struct scsi_address ap;
-        int rc;
-        //struct buf *bp;
-
-        _DBG_FUN();
-        delay(1000);
-        _LOG("Got woken up ! Allocating a SCSI packet.");
-
-        /* Setup SCSI address for the target. */
-        ap.a_target = 0;
-        ap.a_lun = 0;
-        ap.a_hba_tran = pvs->m_tran;
-
-        /* Allocate a DMA buffer for the return data. */
-        //bp = scsi_alloc_consistent_buf(&ap, (struct buf *)NULL, );
-
-        /* Allocate a packet for SCMD_TEST_UNIT_READY command. */
-        _LOG("Allocating a SCSI packet.");
-        pkt = scsi_init_pkt(&ap, (struct scsi_pkt *)NULL, NULL,
-                            CDB_GROUP0, sizeof (struct scsi_arq_status),
-                            0, 0, __test_scsi_cb, NULL);
-        if (pkt == NULL) {
-                _LOG("failed to allocate SCSI packet !");
-                return;
-        }
-
-        /* Setup CDB. */
-        _LOG("SCSI packet allocated. Setting up CDB.");
-        scsi_setup_cdb((union scsi_cdb *)pkt->pkt_cdbp,
-                       SCMD_TEST_UNIT_READY, 0, 0, 0);
-	pkt->pkt_flags = FLAG_NOINTR|FLAG_NOPARITY;
-        _LOG("Executing SCSI command ...");
-        rc = scsi_poll(pkt);
-        _LOG("scsi_poll(): %d", rc);
-
-        _LOG("Destroying the packet.");
-        scsi_destroy_pkt(pkt);
-        _LOG("Packet destroyed.");
-
-        //vmw_pvscsi_queue_pkt(NULL, pvs);
-}
-
-static void __transport_test(vmw_pvscsi_softstate_t *pvs)
-{
-        _LOG("Testing SCSI packet delivery ...");
-        if (taskq_dispatch(system_taskq, __test_fn, pvs, TS_SLEEP) == NULL) {
-                _LOG("failed to launch test action !");
-        }
-}
 
 static int vmw_pvscsi_allocate_rings(vmw_pvscsi_softstate_t *pvs)
 {
@@ -1335,6 +1341,11 @@ static void vmw_pvscsi_process_irq(vmw_pvscsi_softstate_t *pvs)
                 ASSERT(cmd);
                 cmd->next_cmd = NULL;
 
+                /* Savecommand status for further processing. */
+                cmd->cmp_stat.hostStatus = cdesc->hostStatus;
+                cmd->cmp_stat.scsiStatus = cdesc->scsiStatus;
+                cmd->cmp_stat.dataLen = cdesc->dataLen;
+
                 if (is_new_slot) {
                         if (cmds_for_workers[slot] != NULL) {
                                 cmds_for_workers[slot]->tail_cmd->next_cmd = cmd;
@@ -1522,8 +1533,73 @@ static int vmw_pvscsi_setup_irq(vmw_pvscsi_softstate_t *pvs)
         return (pvs->irq_type == 0) ? (DDI_FAILURE) : (DDI_SUCCESS);
 }
 
+static void vmw_pvscsi_scsi_good_cmd(vmw_pvscsi_cmd_t *cmd)
+{
+        struct scsi_pkt *pkt = CMD2PKT(cmd);
 
-static void vmw_pvscsi_complete_command(vmw_pvscsi_cmd_t *cmd)
+        _LOG("* GOOD CMD: %p", cmd);
+        pkt->pkt_state |= (STATE_GOT_BUS | STATE_GOT_TARGET | STATE_SENT_CMD |
+                           STATE_GOT_STATUS);
+        if (cmd->flags & (VMW_PVSCSI_CMD_DMA_VALID)) {
+                pkt->pkt_state |= STATE_XFERRED_DATA;
+        }
+        pkt->pkt_reason = CMD_CMPLT;
+        pkt->pkt_resid = 0;
+}
+
+static void vmw_pvscsi_set_command_status(vmw_pvscsi_cmd_t *cmd, vmw_pvscsi_softstate_t *pvs)
+{
+        uint32_t scsi_status = cmd->cmp_stat.scsiStatus;
+        uint32_t host_status = cmd->cmp_stat.hostStatus;
+        struct scsi_pkt *pkt = CMD2PKT(cmd);
+
+        _LOG("** scsi_status: 0x%X, host_status: 0x%X",
+             scsi_status, host_status);
+        if ((scsi_status != STATUS_GOOD) && ((host_status == BTSTAT_SUCCESS) ||
+                                             (host_status == BTSTAT_LINKED_COMMAND_COMPLETED) ||
+                                             (host_status == BTSTAT_LINKED_COMMAND_COMPLETED_WITH_FLAG))) {
+                vmw_pvscsi_scsi_good_cmd(cmd);
+        } else {
+                switch (host_status) {
+                case BTSTAT_SUCCESS:
+		case BTSTAT_LINKED_COMMAND_COMPLETED:
+		case BTSTAT_LINKED_COMMAND_COMPLETED_WITH_FLAG:
+                        vmw_pvscsi_scsi_good_cmd(cmd);
+                        break;
+                case BTSTAT_DATARUN:
+                        pkt->pkt_reason = CMD_DATA_OVR;
+			pkt->pkt_state |= (STATE_GOT_BUS | STATE_GOT_TARGET | STATE_SENT_CMD | STATE_GOT_STATUS
+                                           | STATE_XFERRED_DATA);
+                        pkt->pkt_resid = 0;
+                        break;
+		case BTSTAT_DATA_UNDERRUN:
+                        pkt->pkt_reason = pkt->pkt_state |= (STATE_GOT_BUS | STATE_GOT_TARGET
+                                                             | STATE_SENT_CMD | STATE_GOT_STATUS);
+                        pkt->pkt_resid = cmd->dma_count - cmd->cmp_stat.dataLen;
+                        if (pkt->pkt_resid != cmd->dma_count) {
+				pkt->pkt_state |= STATE_XFERRED_DATA;
+			}
+                        break;
+                case BTSTAT_SELTIMEO:
+                        pkt->pkt_reason = CMD_DEV_GONE;
+			pkt->pkt_state |= STATE_GOT_BUS;
+                        break;
+		case BTSTAT_TAGREJECT:
+                        pkt->pkt_reason = CMD_TAG_REJECT;
+			pkt->pkt_state |= (STATE_GOT_BUS | STATE_GOT_TARGET
+                                           | STATE_SENT_CMD | STATE_GOT_STATUS);
+                        break;
+                default:
+                        /* TODO: Add support of the rest of the PVSCSI h/w command status codes. */
+                        pkt->pkt_reason = CMD_INCOMPLETE;
+                        pkt->pkt_state |= (STATE_GOT_BUS | STATE_GOT_TARGET
+                                           | STATE_SENT_CMD | STATE_GOT_STATUS);
+                        break;
+                }
+        }
+}
+
+static void vmw_pvscsi_complete_command(vmw_pvscsi_cmd_t *cmd, vmw_pvscsi_softstate_t *pvs)
 {
         struct scsi_pkt *pkt = CMD2PKT(cmd);
 
@@ -1537,6 +1613,7 @@ static void vmw_pvscsi_complete_command(vmw_pvscsi_cmd_t *cmd)
                         ddi_dma_sync(cmd->cmd_handle, 0, 0, DDI_DMA_SYNC_FORCPU);
                 }
 
+                vmw_pvscsi_set_command_status(cmd, pvs);
                 cmd->flags |= VMW_PVSCSI_CMD_DONE;
                 membar_producer();
 
@@ -1575,7 +1652,7 @@ static void vmw_pvscsi_irq_worker_fn(vmw_pvscsi_worker_state_t *ws)
 
                         while (cmd) {
                                 scmd = cmd->next_cmd;
-                                vmw_pvscsi_complete_command(cmd);
+                                vmw_pvscsi_complete_command(cmd, ws->pvs);
                                 cmd = scmd;
                         }
                 }
@@ -1738,8 +1815,7 @@ static int vmw_pvscsi_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
                 goto clear_hba;
         }
 
-        __transport_test(pvs);
-        //vmw_pvscsi_queue_pkt(NULL, pvs);
+        pvscsi_test(pvs->m_tran);
 
         _DBG("vmw_pvscsi_attach(): New instance of PVSCSI HBA attached.");
         return (DDI_SUCCESS);

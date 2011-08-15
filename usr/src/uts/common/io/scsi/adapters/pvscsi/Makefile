@@ -30,7 +30,7 @@ LDFLAGS= -r -dy -Nmisc/scsi -Ndrv/scsi_vhci
 CC=gcc
 LD=/usr/ccs/bin/ld
 
-SOURCES=os_vmw_pvscsi.c
+SOURCES=os_vmw_pvscsi.c tests.c
 OBJECTS=$(SOURCES:%.c=%.o)
 TARGET=os_vmw_pvscsi
 
