@@ -117,6 +117,11 @@ typedef struct vmxnet3_rxqueue_t {
 } vmxnet3_rxqueue_t;
 
 
+typedef struct vmxnet3_cachedtx_t {
+   uint64_t             pa;
+   caddr_t              va;
+} vmxnet3_cachedtx_t;
+
 typedef struct vmxnet3_softc_t {
    dev_info_t          *dip;
    int                  instance;
@@ -151,6 +156,12 @@ typedef struct vmxnet3_softc_t {
    vmxnet3_rxpool_t     rxPool;
    volatile uint32_t    rxNumBufs;
    uint32_t             rxMode;
+
+   ddi_dma_handle_t     dataDmaHandle;
+   size_t               dataBufferSize;
+   ddi_acc_handle_t     dataBufferAccHandle;
+   caddr_t              dataBufferAddr;
+   vmxnet3_cachedtx_t  *dataBufferCache;
 
    vmxnet3_dmabuf_t     mfTable;
 } vmxnet3_softc_t;

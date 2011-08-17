@@ -360,6 +360,103 @@ vmxnet3_alloc_compring(vmxnet3_softc_t *dp, vmxnet3_compring_t *compRing)
    return DDI_SUCCESS;
 }
 
+/* DMA attributes for data buffer, little endian as specs state. */
+static ddi_device_acc_attr_t vmxnet3_dring_acc_attr = {
+  DDI_DEVICE_ATTR_V0,
+  DDI_STRUCTURE_LE_ACC,
+  DDI_STRICTORDER_ACC
+};
+
+/* Data ring DMA description */
+static ddi_dma_attr_t vmxnet3_dma_attrs_dring = {
+   DMA_ATTR_V0,           /* dma_attr_version */
+   0x0000000000000000ull, /* dma_attr_addr_lo */
+   0xFFFFFFFFFFFFFFFFull, /* dma_attr_addr_hi */
+   0xFFFFFFFFFFFFFFFFull, /* dma_attr_count_max */
+   0x0000000000000001ull, /* dma_attr_align */
+   0x0000000000000001ull, /* dma_attr_burstsizes */
+   0x00000001,            /* dma_attr_minxfer */
+   (VMXNET3_HDR_COPY_SIZE * VMXNET3_TX_RING_MAX_SIZE), /* dma_attr_maxxfer */
+   0xFFFFFFFFFFFFFFFFull, /* dma_attr_seg */
+   1,                    /* dma_attr_sgllen */
+   0x00000001,            /* dma_attr_granular */
+   0                      /* dma_attr_flags */
+};
+
+void
+vmxnet3_tx_data_cache_release(vmxnet3_softc_t *dp, vmxnet3_txqueue_t *txq)
+{
+        ddi_dma_mem_free(&dp->dataBufferAccHandle);
+        ddi_dma_free_handle(&dp->dataDmaHandle);
+        dp->dataBufferAddr = NULL;
+        dp->dataBufferSize = 0;
+}
+
+int
+vmxnet3_tx_data_cache_init(vmxnet3_softc_t *dp, vmxnet3_txqueue_t *txq)
+{
+   int i, ccount;
+   ddi_dma_cookie_t cookie;
+   caddr_t va;
+   uint64_t pa;
+
+   dp->dataBufferAddr = NULL;
+   dp->dataBufferSize = 0;
+
+   dp->dataBufferCache = kmem_zalloc(txq->cmdRing.size * sizeof(vmxnet3_cachedtx_t),
+                                     KM_SLEEP);
+   ASSERT(txq->dataBufferCache);
+
+   /*
+    * Allocate the Data ring DMA handle.
+    */
+   if (ddi_dma_alloc_handle(dp->dip, &vmxnet3_dma_attrs_dring, DDI_DMA_SLEEP,
+                            NULL, &dp->dataDmaHandle) != DDI_SUCCESS) {
+      VMXNET3_WARN(dp, "ddi_dma_alloc_handle() failed for Data ring: MAX %ld bytes\n",
+                   (long)vmxnet3_dma_attrs_dring.dma_attr_maxxfer);
+      return (DDI_FAILURE);
+   }
+
+   /* Now initialize data buffer. */
+   i = ddi_dma_mem_alloc(dp->dataDmaHandle,
+                         txq->cmdRing.size * VMXNET3_HDR_COPY_SIZE,
+                         &vmxnet3_dring_acc_attr, DDI_DMA_CONSISTENT,
+                         DDI_DMA_SLEEP, 0, &dp->dataBufferAddr,
+                         &dp->dataBufferSize, &dp->dataBufferAccHandle);
+   if (i != DDI_SUCCESS) {
+           cmn_err(CE_WARN, "** Failed to allocate %d bytes for Data ring: %d",
+                   txq->cmdRing.size * VMXNET3_HDR_COPY_SIZE, i);
+           ddi_dma_free_handle(&dp->dataDmaHandle);
+           return (i);
+   }
+
+   i = ddi_dma_addr_bind_handle(dp->dataDmaHandle, NULL,
+                                dp->dataBufferAddr, dp->dataBufferSize,
+                                DDI_DMA_RDWR | DDI_DMA_CONSISTENT, DDI_DMA_SLEEP,
+                                0, &cookie, &ccount);
+   if (i != DDI_SUCCESS) {
+           cmn_err(CE_WARN, "** Failed to bind Data ring: %d", i);
+           vmxnet3_tx_data_cache_release(dp, txq);
+           return (i);
+   }
+
+   cmn_err(CE_WARN, "** Cookies: %d", ccount);
+   ASSERT(ccount == 1);
+
+   va = dp->dataBufferAddr;
+   pa = cookie.dmac_laddress;
+   for (i=0; i<txq->cmdRing.size; i++) {
+           dp->dataBufferCache[i].pa = pa;
+           dp->dataBufferCache[i].va = va;
+
+           pa += VMXNET3_HDR_COPY_SIZE;
+           va += VMXNET3_HDR_COPY_SIZE;
+   }
+
+   return DDI_SUCCESS;
+}
+
+
 /*
  *---------------------------------------------------------------------------
  *
@@ -402,6 +499,10 @@ vmxnet3_prepare_txqueue(vmxnet3_softc_t *dp)
    txq->metaRing = kmem_zalloc(txq->cmdRing.size*sizeof(vmxnet3_metatx_t),
                                KM_SLEEP);
    ASSERT(txq->metaRing);
+
+   if (vmxnet3_tx_data_cache_init(dp, txq) != DDI_SUCCESS) {
+           goto error_mpring;
+   }
 
    if (vmxnet3_txqueue_init(dp, txq) != DDI_SUCCESS) {
       goto error_mpring;

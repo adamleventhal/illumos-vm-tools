@@ -100,7 +100,7 @@ vmxnet3_txqueue_fini(vmxnet3_softc_t *dp, vmxnet3_txqueue_t *txq)
 static int
 vmxnet3_tx_prepare_offload(vmxnet3_softc_t *dp,
                            vmxnet3_offload_t *ol,
-                           mblk_t *mp)
+                           mblk_t *mp, int *to_copy)
 {
    int ret = 0;
    uint32_t start, stuff, value, flags, lsoflags, mss;
@@ -168,6 +168,8 @@ vmxnet3_tx_prepare_offload(vmxnet3_softc_t *dp,
 
          if (mblk != mp) {
             ret = ol->hlen;
+         } else {
+            *to_copy = ol->hlen;
          }
       }
    }
@@ -197,7 +199,7 @@ static vmxnet3_txstatus
 vmxnet3_tx_one(vmxnet3_softc_t *dp,
                vmxnet3_txqueue_t *txq,
                vmxnet3_offload_t *ol,
-               mblk_t *mp)
+               mblk_t *mp, int to_copy)
 {
    int ret = VMXNET3_TX_OK;
    unsigned int frags = 0, totLen = 0;
@@ -207,6 +209,8 @@ vmxnet3_tx_one(vmxnet3_softc_t *dp,
    uint16_t sopIdx, eopIdx;
    uint8_t sopGen, curGen;
    mblk_t *mblk;
+   unsigned int len;
+   size_t offset = 0;
 
    mutex_enter(&dp->txLock);
 
@@ -214,7 +218,50 @@ vmxnet3_tx_one(vmxnet3_softc_t *dp,
    sopGen = cmdRing->gen;
    curGen = !cmdRing->gen;
 
-   for (mblk = mp; mblk != NULL; mblk = mblk->b_cont) {
+   mblk = mp;
+   len = MBLKL(mblk);
+
+   if (to_copy) {
+           uint32_t dw2, dw3;
+
+           ASSERT(len >= to_copy);
+
+           if (cmdRing->avail <= 2) {
+                   ret = VMXNET3_TX_FAILURE;
+                   goto done;
+           }
+           totLen += to_copy;
+
+           len -= to_copy;
+           offset = to_copy;
+
+           bcopy(mblk->b_rptr, dp->dataBufferCache[sopIdx].va, to_copy);
+
+           eopIdx = cmdRing->next2fill;
+           txDesc = VMXNET3_GET_DESC(cmdRing, eopIdx);
+
+           ASSERT(txDesc->txd.gen != cmdRing->gen);
+
+            // txd.addr
+            txDesc->txd.addr = dp->dataBufferCache[sopIdx].pa;
+            // txd.dw2
+            dw2 = to_copy;
+            dw2 |= curGen << VMXNET3_TXD_GEN_SHIFT;
+            txDesc->dword[2] = dw2;
+            ASSERT(txDesc->txd.len == to_copy || txDesc->txd.len == 0);
+            // txd.dw3
+            dw3 = 0;
+            txDesc->dword[3] = dw3;
+
+            VMXNET3_INC_RING_IDX(cmdRing, cmdRing->next2fill);
+            curGen = cmdRing->gen;
+
+            frags++;
+   }
+
+//   for (mblk = mp; mblk != NULL; mblk = mblk->b_cont) {
+
+   for (; mblk != NULL; mblk = mblk->b_cont, len = mblk ? MBLKL(mblk) : 0, offset = 0) {
       unsigned int len = MBLKL(mblk);
       ddi_dma_cookie_t cookie;
       uint_t cookieCount;
@@ -226,7 +273,7 @@ vmxnet3_tx_one(vmxnet3_softc_t *dp,
       }
 
       if (ddi_dma_addr_bind_handle(dp->txDmaHandle, NULL,
-                                   (caddr_t) mblk->b_rptr, len,
+                                   (caddr_t) mblk->b_rptr + offset, len,
                                    DDI_DMA_RDWR | DDI_DMA_STREAMING,
                                    DDI_DMA_DONTWAIT, NULL,
                                    &cookie, &cookieCount) != DDI_DMA_MAPPED) {
@@ -378,7 +425,7 @@ vmxnet3_tx(void *data, mblk_t *mps)
 
    do {
       vmxnet3_offload_t ol;
-      int pullup;
+      int pullup, to_copy;
 
       mp = mps;
       mps = mp->b_next;
@@ -399,7 +446,8 @@ vmxnet3_tx(void *data, mblk_t *mps)
        * Prepare the offload while we're still handling the original
        * message -- msgpullup() discards the metadata afterwards.
        */
-      pullup = vmxnet3_tx_prepare_offload(dp, &ol, mp);
+      to_copy = 0;
+      pullup = vmxnet3_tx_prepare_offload(dp, &ol, mp, &to_copy);
       if (pullup) {
          mblk_t *new_mp = msgpullup(mp, pullup);
          freemsg(mp);
@@ -414,7 +462,7 @@ vmxnet3_tx(void *data, mblk_t *mps)
        * Try to map the message in the Tx ring.
        * This call might fail for non-fatal reasons.
        */
-      status = vmxnet3_tx_one(dp, txq, &ol, mp);
+      status = vmxnet3_tx_one(dp, txq, &ol, mp, to_copy);
       if (status == VMXNET3_TX_PULLUP) {
          /*
           * Try one more time after flattening
@@ -425,7 +473,7 @@ vmxnet3_tx(void *data, mblk_t *mps)
             freemsg(mp);
             if (new_mp) {
                mp = new_mp;
-               status = vmxnet3_tx_one(dp, txq, &ol, mp);
+               status = vmxnet3_tx_one(dp, txq, &ol, mp, to_copy);
             } else {
                continue;
             }
