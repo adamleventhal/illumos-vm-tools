@@ -116,11 +116,22 @@ typedef struct vmxnet3_rxqueue_t {
    Vmxnet3_RxQueueCtrl *sharedCtrl;
 } vmxnet3_rxqueue_t;
 
+typedef struct vmxnet3_tx_cache_node {
+   uint64_t pa;
+   caddr_t  va;
+} vmxnet3_tx_cache_node_t;
 
-typedef struct vmxnet3_cachedtx_t {
-   uint64_t             pa;
-   caddr_t              va;
-} vmxnet3_cachedtx_t;
+#define VMXNET3_TX_CACHE_ITEMS_PER_PAGE (PAGESIZE / VMXNET3_HDR_COPY_SIZE)
+#define VMXNET3_TX_CACHE_MAX_PAGES (VMXNET3_TX_RING_MAX_SIZE / VMXNET3_TX_CACHE_ITEMS_PER_PAGE)
+
+typedef struct vmxnet3_tx_cache {
+   int num_pages;
+   page_t **pages;
+   caddr_t *page_maps;
+   vmxnet3_tx_cache_node_t *nodes;
+   int num_nodes;
+   caddr_t vindow;
+} vmxnet3_tx_cache_t;
 
 typedef struct vmxnet3_softc_t {
    dev_info_t          *dip;
@@ -157,12 +168,7 @@ typedef struct vmxnet3_softc_t {
    volatile uint32_t    rxNumBufs;
    uint32_t             rxMode;
 
-   ddi_dma_handle_t     dataDmaHandle;
-   size_t               dataBufferSize;
-   ddi_acc_handle_t     dataBufferAccHandle;
-   caddr_t              dataBufferAddr;
-   vmxnet3_cachedtx_t  *dataBufferCache;
-
+   vmxnet3_tx_cache_t   txCache;
    vmxnet3_dmabuf_t     mfTable;
 } vmxnet3_softc_t;
 

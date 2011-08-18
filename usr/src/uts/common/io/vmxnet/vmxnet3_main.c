@@ -15,6 +15,8 @@
  *********************************************************/
 
 #include "vmxnet3_solaris.h"
+#include <sys/kmem.h>
+#include <vm/seg_kmem.h>
 
 /*
  * TODO:
@@ -360,100 +362,134 @@ vmxnet3_alloc_compring(vmxnet3_softc_t *dp, vmxnet3_compring_t *compRing)
    return DDI_SUCCESS;
 }
 
-/* DMA attributes for data buffer, little endian as specs state. */
-static ddi_device_acc_attr_t vmxnet3_dring_acc_attr = {
-  DDI_DEVICE_ATTR_V0,
-  DDI_STRUCTURE_LE_ACC,
-  DDI_STRICTORDER_ACC
-};
-
-/* Data ring DMA description */
-static ddi_dma_attr_t vmxnet3_dma_attrs_dring = {
-   DMA_ATTR_V0,           /* dma_attr_version */
-   0x0000000000000000ull, /* dma_attr_addr_lo */
-   0xFFFFFFFFFFFFFFFFull, /* dma_attr_addr_hi */
-   0xFFFFFFFFFFFFFFFFull, /* dma_attr_count_max */
-   0x0000000000000001ull, /* dma_attr_align */
-   0x0000000000000001ull, /* dma_attr_burstsizes */
-   0x00000001,            /* dma_attr_minxfer */
-   (VMXNET3_HDR_COPY_SIZE * VMXNET3_TX_RING_MAX_SIZE), /* dma_attr_maxxfer */
-   0xFFFFFFFFFFFFFFFFull, /* dma_attr_seg */
-   1,                    /* dma_attr_sgllen */
-   0x00000001,            /* dma_attr_granular */
-   0                      /* dma_attr_flags */
-};
-
 void
-vmxnet3_tx_data_cache_release(vmxnet3_softc_t *dp, vmxnet3_txqueue_t *txq)
+vmxnet3_tx_cache_release(vmxnet3_softc_t *dp)
 {
-        ddi_dma_mem_free(&dp->dataBufferAccHandle);
-        ddi_dma_free_handle(&dp->dataDmaHandle);
-        dp->dataBufferAddr = NULL;
-        dp->dataBufferSize = 0;
+   int i;
+   vmxnet3_tx_cache_t *cache = &dp->txCache;
+
+   /* Unmap pages. */
+   hat_unload(kas.a_hat, cache->vindow, ptob(cache->num_pages),
+              HAT_UNLOAD_UNLOCK);
+   vmem_free(heap_arena, cache->vindow, ptob(cache->num_pages));
+
+   /* Free pages. */
+   for (i = 0; i < cache->num_pages; i++) {
+           page_free(cache->pages[i], 0);
+   }
+   page_unresv(cache->num_pages);
+
+   kmem_free(cache->pages, cache->num_pages * sizeof(page_t *));
+   kmem_free(cache->page_maps, cache->num_pages * sizeof(page_t *));
+   kmem_free(cache->nodes, cache->num_nodes * sizeof(vmxnet3_tx_cache_node_t));
 }
 
 int
-vmxnet3_tx_data_cache_init(vmxnet3_softc_t *dp, vmxnet3_txqueue_t *txq)
+vmxnet3_tx_cache_init(vmxnet3_softc_t *dp, vmxnet3_txqueue_t *txq)
 {
-   int i, ccount;
-   ddi_dma_cookie_t cookie;
-   caddr_t va;
-   uint64_t pa;
+   int i;
+   vmxnet3_tx_cache_t *cache = &dp->txCache;
+   struct seg kseg;
+   page_t *page;
+   int ndescrs, node;
 
-   dp->dataBufferAddr = NULL;
-   dp->dataBufferSize = 0;
+   cache->num_pages = ((txq->cmdRing.size*VMXNET3_HDR_COPY_SIZE)+(PAGESIZE-1))
+           / PAGESIZE;
 
-   dp->dataBufferCache = kmem_zalloc(txq->cmdRing.size * sizeof(vmxnet3_cachedtx_t),
-                                     KM_SLEEP);
-   ASSERT(txq->dataBufferCache);
-
-   /*
-    * Allocate the Data ring DMA handle.
-    */
-   if (ddi_dma_alloc_handle(dp->dip, &vmxnet3_dma_attrs_dring, DDI_DMA_SLEEP,
-                            NULL, &dp->dataDmaHandle) != DDI_SUCCESS) {
-      VMXNET3_WARN(dp, "ddi_dma_alloc_handle() failed for Data ring: MAX %ld bytes\n",
-                   (long)vmxnet3_dma_attrs_dring.dma_attr_maxxfer);
-      return (DDI_FAILURE);
+   /* Allocate pages. */
+   if (!page_resv(cache->num_pages, KM_SLEEP)) {
+           VMXNET3_WARN(dp, "Failed to reserve %d pages.", cache->num_pages);
+           goto out;
    }
 
-   /* Now initialize data buffer. */
-   i = ddi_dma_mem_alloc(dp->dataDmaHandle,
-                         txq->cmdRing.size * VMXNET3_HDR_COPY_SIZE,
-                         &vmxnet3_dring_acc_attr, DDI_DMA_CONSISTENT,
-                         DDI_DMA_SLEEP, 0, &dp->dataBufferAddr,
-                         &dp->dataBufferSize, &dp->dataBufferAccHandle);
-   if (i != DDI_SUCCESS) {
-           cmn_err(CE_WARN, "** Failed to allocate %d bytes for Data ring: %d",
-                   txq->cmdRing.size * VMXNET3_HDR_COPY_SIZE, i);
-           ddi_dma_free_handle(&dp->dataDmaHandle);
-           return (i);
+   if (!page_create_wait(cache->num_pages, 0)) {
+           VMXNET3_WARN(dp, "Failed to create %d pages.", cache->num_pages);
+           goto unresv_pages;
    }
 
-   i = ddi_dma_addr_bind_handle(dp->dataDmaHandle, NULL,
-                                dp->dataBufferAddr, dp->dataBufferSize,
-                                DDI_DMA_RDWR | DDI_DMA_CONSISTENT, DDI_DMA_SLEEP,
-                                0, &cookie, &ccount);
-   if (i != DDI_SUCCESS) {
-           cmn_err(CE_WARN, "** Failed to bind Data ring: %d", i);
-           vmxnet3_tx_data_cache_release(dp, txq);
-           return (i);
+   cache->pages = kmem_zalloc(cache->num_pages * sizeof(page_t *), KM_SLEEP);
+   ASSERT(cache->pages);
+
+   cache->page_maps = kmem_zalloc(cache->num_pages * sizeof(page_t *), KM_SLEEP);
+   ASSERT(cache->page_maps);
+
+   kseg.s_as = &kas;
+   for (i = 0; i < cache->num_pages; i++) {
+           page = page_get_freelist(&kvp, 0, &kseg, (caddr_t)(i * PAGESIZE),
+                                    PAGESIZE, 0, NULL);
+           if (page == NULL) {
+                   page = page_get_cachelist(&kvp, 0, &kseg,
+                                             (caddr_t)(i * PAGESIZE), 0, NULL);
+                   if (page == NULL) {
+                           goto free_pages;
+                   }
+                   if (!PP_ISAGED(page)) {
+                           page_hashout(page, NULL);
+                   }
+           }
+           PP_CLRFREE(page);
+           PP_CLRAGED(page);
+           cache->pages[i] = page;
    }
 
-   cmn_err(CE_WARN, "** Cookies: %d", ccount);
-   ASSERT(ccount == 1);
-
-   va = dp->dataBufferAddr;
-   pa = cookie.dmac_laddress;
-   for (i=0; i<txq->cmdRing.size; i++) {
-           dp->dataBufferCache[i].pa = pa;
-           dp->dataBufferCache[i].va = va;
-
-           pa += VMXNET3_HDR_COPY_SIZE;
-           va += VMXNET3_HDR_COPY_SIZE;
+   for (i = 0; i < cache->num_pages; i++) {
+           page_downgrade(cache->pages[i]);
    }
 
-   return DDI_SUCCESS;
+   /* Allocate virtual address range for mapping pages. */
+   cache->vindow = vmem_alloc(heap_arena, ptob(cache->num_pages), VM_SLEEP);
+   ASSERT(cache->vindow);
+
+   cache->num_nodes = txq->cmdRing.size;
+
+   /* Map pages. */
+   for (i = 0; i < cache->num_pages; i++) {
+           cache->page_maps[i] = cache->vindow + ptob(i);
+           hat_devload(kas.a_hat, cache->page_maps[i], ptob(1),
+                       cache->pages[i]->p_pagenum,
+                       PROT_READ | PROT_WRITE | HAT_STRICTORDER, HAT_LOAD_LOCK);
+   }
+
+   /* Now setup cache items. */
+   cache->nodes = kmem_zalloc(txq->cmdRing.size*sizeof(vmxnet3_tx_cache_node_t),
+                              KM_SLEEP);
+   ASSERT(cache->nodes);
+
+   ndescrs = txq->cmdRing.size;
+   node = 0;
+   for (i = 0; i < cache->num_pages; i++) {
+           int j, lim;
+           caddr_t va;
+           uint64_t pa;
+
+           lim = (ndescrs <= VMXNET3_TX_CACHE_ITEMS_PER_PAGE) ? ndescrs :
+                   VMXNET3_TX_CACHE_ITEMS_PER_PAGE;
+           va = cache->page_maps[i];
+           pa = cache->pages[i]->p_pagenum << PAGESHIFT;
+
+           for (j = 0; j < lim; j++) {
+                   cache->nodes[node].pa = pa;
+                   cache->nodes[node].va = va;
+
+                   pa += VMXNET3_HDR_COPY_SIZE;
+                   va += VMXNET3_HDR_COPY_SIZE;
+                   node++;
+           }
+           ndescrs -= lim;
+   }
+   return (DDI_SUCCESS);
+
+free_pages:
+   page_create_putback(cache->num_pages - i);
+   while (--i >= 0) {
+           page_free(cache->pages[i], 0);
+   }
+   kmem_free(cache->pages, cache->num_pages * PAGESIZE);
+unresv_pages:
+   page_unresv(cache->num_pages);
+out:
+   cache->num_pages = cache->num_nodes = 0;
+   return (DDI_FAILURE);
 }
 
 
@@ -500,16 +536,18 @@ vmxnet3_prepare_txqueue(vmxnet3_softc_t *dp)
                                KM_SLEEP);
    ASSERT(txq->metaRing);
 
-   if (vmxnet3_tx_data_cache_init(dp, txq) != DDI_SUCCESS) {
-           goto error_mpring;
+   if (vmxnet3_tx_cache_init(dp, txq) != DDI_SUCCESS) {
+      goto error_mpring;
    }
 
    if (vmxnet3_txqueue_init(dp, txq) != DDI_SUCCESS) {
-      goto error_mpring;
+      goto error_txcache;
    }
 
    return DDI_SUCCESS;
 
+error_txcache:
+   vmxnet3_tx_cache_release(dp);
 error_mpring:
    kmem_free(txq->metaRing, txq->cmdRing.size*sizeof(vmxnet3_metatx_t));
    vmxnet3_free_dma_mem(&txq->compRing.dma);
@@ -606,6 +644,8 @@ vmxnet3_destroy_txqueue(vmxnet3_softc_t *dp)
 
    vmxnet3_free_dma_mem(&txq->cmdRing.dma);
    vmxnet3_free_dma_mem(&txq->compRing.dma);
+
+   vmxnet3_tx_cache_release(dp);
 }
 
 /*

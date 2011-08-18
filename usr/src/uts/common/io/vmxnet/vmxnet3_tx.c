@@ -113,7 +113,7 @@ vmxnet3_tx_prepare_offload(vmxnet3_softc_t *dp,
 
    mac_lso_get(mp, &mss, &lsoflags);
    if (lsoflags & HW_LSO) {
-           flags |= HW_LSO;
+      flags |= HW_LSO;
    }
 
    if (flags) {
@@ -226,7 +226,7 @@ vmxnet3_tx_one(vmxnet3_softc_t *dp,
 
            ASSERT(len >= to_copy);
 
-           if (cmdRing->avail <= 2) {
+           if (cmdRing->avail <= 1) {
                    ret = VMXNET3_TX_FAILURE;
                    goto done;
            }
@@ -235,7 +235,7 @@ vmxnet3_tx_one(vmxnet3_softc_t *dp,
            len -= to_copy;
            offset = to_copy;
 
-           bcopy(mblk->b_rptr, dp->dataBufferCache[sopIdx].va, to_copy);
+           bcopy(mblk->b_rptr, dp->txCache.nodes[sopIdx].va, to_copy);
 
            eopIdx = cmdRing->next2fill;
            txDesc = VMXNET3_GET_DESC(cmdRing, eopIdx);
@@ -243,7 +243,7 @@ vmxnet3_tx_one(vmxnet3_softc_t *dp,
            ASSERT(txDesc->txd.gen != cmdRing->gen);
 
             // txd.addr
-            txDesc->txd.addr = dp->dataBufferCache[sopIdx].pa;
+            txDesc->txd.addr = dp->txCache.nodes[sopIdx].pa;
             // txd.dw2
             dw2 = to_copy;
             dw2 |= curGen << VMXNET3_TXD_GEN_SHIFT;
@@ -258,8 +258,6 @@ vmxnet3_tx_one(vmxnet3_softc_t *dp,
 
             frags++;
    }
-
-//   for (mblk = mp; mblk != NULL; mblk = mblk->b_cont) {
 
    for (; mblk != NULL; mblk = mblk->b_cont, len = mblk ? MBLKL(mblk) : 0, offset = 0) {
       unsigned int len = MBLKL(mblk);
@@ -453,6 +451,7 @@ vmxnet3_tx(void *data, mblk_t *mps)
          freemsg(mp);
          if (new_mp) {
             mp = new_mp;
+            to_copy = pullup;
          } else {
             continue;
          }
