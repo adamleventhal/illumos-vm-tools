@@ -800,7 +800,7 @@ vmw_pvscsi_init_pkt(struct scsi_address *ap, struct scsi_pkt *pkt,
 			ddi_dma_getwin(cmd->cmd_handle, cmd->cmd_winindex,
                                        &cmd->cmd_dma_offset, &cmd->cmd_dma_len,
                                        &cmd->cmd_cookie, &cmd->cmd_cookiec);
-		} else if (rval && (rval != DDI_DMA_MAPPED)) {
+		} else if (rc && (rc != DDI_DMA_MAPPED)) {
 			switch (rc) {
 			case DDI_DMA_NORESOURCES:
 				bioerror(bp, 0);
@@ -836,7 +836,7 @@ vmw_pvscsi_init_pkt(struct scsi_address *ap, struct scsi_pkt *pkt,
                         
                 }
 
-                pkt->pkt_resid = (bp->b_bcount - cmd->cmd_totaldmacount);
+                pkt->pkt_resid = (bp->b_bcount - cmd->cmd_total_dma_count);
         }
 
         return (pkt);
@@ -1815,7 +1815,7 @@ static int vmw_pvscsi_attach(dev_info_t *dip, ddi_attach_cmd_t cmd)
                 goto clear_hba;
         }
 
-        pvscsi_test(pvs->m_tran);
+        //pvscsi_test(pvs->m_tran);
 
         _DBG("vmw_pvscsi_attach(): New instance of PVSCSI HBA attached.");
         return (DDI_SUCCESS);
